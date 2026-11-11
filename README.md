@@ -2,6 +2,12 @@
 
 ReachInbox uses BullMQ and Redis to process large email campaigns reliably.
 
+🎥 **Demo Video**
+
+Watch the complete working demonstration of ReachInbox Email Scheduler.
+
+**Project Demo**: https://drive.google.com/file/d/14JDyqmqOaClLYySPkDXgU0eoJXbpkzZV/view?usp=drive_link
+
 ### Processing strategy
 
 1. All valid email records are stored in PostgreSQL.
