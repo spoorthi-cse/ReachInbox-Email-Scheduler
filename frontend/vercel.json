@@ -1,0 +1,8 @@
+{
+  "rewrites": [
+    {
+      "source": "/api/:path*",
+      "destination": "https://reachinbox-email-scheduler-production-1b051eb2.up.railway.app/api/:path*"
+    }
+  ]
+}
