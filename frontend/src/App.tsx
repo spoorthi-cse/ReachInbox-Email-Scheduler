@@ -13,14 +13,17 @@ type Email = {
   error?: string | null;
 };
 
-type EmailTab = 'scheduled' | 'sent' | 'cancelled';
+type EmailTab = 'scheduled' | 'sent' | 'failed' | 'cancelled';
 
-const API = 'http://localhost:4000/api';
+const API = import.meta.env.DEV
+  ? 'http://localhost:4000/api'
+  : '/api';
 
 export default function App() {
   const [tab, setTab] = useState<EmailTab>('scheduled');
   const [rows, setRows] = useState<Email[]>([]);
   const [compose, setCompose] = useState(false);
+
   const [recipients, setRecipients] = useState<string[]>([]);
   const [subject, setSubject] = useState('');
   const [body, setBody] = useState('');
@@ -31,16 +34,21 @@ export default function App() {
   const [busy, setBusy] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const [initialLoading, setInitialLoading] = useState(true);
+
   const [notice, setNotice] = useState('');
   const [noticeType, setNoticeType] = useState<'success' | 'error'>('success');
+  const [composeError, setComposeError] = useState('');
 
-  const showNotice = (message: string, type: 'success' | 'error' = 'success') => {
+  const showNotice = (
+    message: string,
+    type: 'success' | 'error' = 'success'
+  ) => {
     setNotice(message);
     setNoticeType(type);
   };
 
   // Fetch emails
-  const load = useCallback(async (initial = false) => {
+  const load = useCallback(async () => {
     setRefreshing(true);
 
     try {
@@ -59,7 +67,10 @@ export default function App() {
     } catch (error) {
       console.error('Loading error:', error);
 
-      showNotice('Unable to load emails. Please check the backend.', 'error');
+      showNotice(
+        'Unable to load emails. Please check the backend.',
+        'error'
+      );
 
     } finally {
       setRefreshing(false);
@@ -72,62 +83,148 @@ export default function App() {
     setInitialLoading(true);
     load();
 
-    const interval = setInterval(() => load(), 3000);
+    const interval = setInterval(() => {
+      load();
+    }, 3000);
 
     return () => clearInterval(interval);
   }, [load]);
 
-  // CSV upload
+  // Email validation
+  function isValidEmail(email: string): boolean {
+    return (
+      email.length <= 254 &&
+      /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)
+    );
+  }
+
+  // CSV upload and validation
   function parseCsv(file: File) {
+    setComposeError('');
+
+    if (!file.name.toLowerCase().endsWith('.csv')) {
+      setRecipients([]);
+      setComposeError('Please upload a CSV file.');
+      return;
+    }
+
     Papa.parse(file, {
+      skipEmptyLines: true,
+
       complete: (result) => {
-        const values = (result.data as unknown[])
-          .flatMap(value =>
-            Array.isArray(value) ? value : [value]
-          )
+        const values = (result.data as unknown[][])
+          .flatMap(row => row)
           .map(value => String(value).trim())
-          .filter(value =>
-            /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value)
+          .filter(Boolean);
+
+        const emailValues = values.filter(
+          value => value.toLowerCase() !== 'email'
+        );
+
+        const validEmails: string[] = [];
+        const invalidEmails: string[] = [];
+
+        for (const value of emailValues) {
+          if (isValidEmail(value)) {
+            validEmails.push(value);
+          } else {
+            invalidEmails.push(value);
+          }
+        }
+
+        const uniqueEmails = [
+          ...new Map(
+            validEmails.map(email => [
+              email.toLowerCase(),
+              email
+            ])
+          ).values()
+        ];
+
+        // Do not allow partial campaigns with invalid addresses
+        if (invalidEmails.length > 0) {
+          setRecipients([]);
+
+          setComposeError(
+            `Found ${invalidEmails.length} invalid email address(es): ${invalidEmails.join(', ')}. Please correct your CSV and upload it again.`
           );
 
-        const uniqueEmails = [...new Set(values)];
+          return;
+        }
 
         setRecipients(uniqueEmails);
 
-        showNotice(
-          uniqueEmails.length > 0
-            ? `Loaded ${uniqueEmails.length} valid email addresses.`
-            : 'No valid email addresses found.',
-          uniqueEmails.length > 0 ? 'success' : 'error'
-        );
+        if (uniqueEmails.length === 0) {
+          setComposeError(
+            'No email addresses found. Please check your CSV file.'
+          );
+        } else {
+          setComposeError('');
+
+          showNotice(
+            `Successfully loaded ${uniqueEmails.length} valid email address(es).`,
+            'success'
+          );
+        }
       },
 
       error: () => {
-        showNotice('Unable to read CSV file.', 'error');
+        setRecipients([]);
+        setComposeError('Unable to read CSV file.');
       }
     });
   }
 
   // Schedule emails
   async function schedule() {
-    if (
-      recipients.length === 0 ||
-      !subject.trim() ||
-      !body.trim() ||
-      !startAt
-    ) {
-      showNotice('Fill all fields and upload a valid CSV.', 'error');
+    console.log('Schedule button clicked');
+
+    setComposeError('');
+
+    if (busy) return;
+
+    if (recipients.length === 0) {
+      setComposeError(
+        'Please upload a CSV containing valid email addresses.'
+      );
       return;
     }
 
-    if (new Date(startAt).getTime() <= Date.now()) {
-      showNotice('Please select a future date and time.', 'error');
+    if (!subject.trim() || !body.trim() || !startAt) {
+      setComposeError(
+        'Please fill in the subject, email body and schedule date.'
+      );
+      return;
+    }
+
+    const selectedDate = new Date(startAt);
+
+    if (Number.isNaN(selectedDate.getTime())) {
+      setComposeError('Please enter a valid schedule date and time.');
+      return;
+    }
+
+    if (selectedDate.getTime() <= Date.now()) {
+      setComposeError('Please select a future date and time.');
+      return;
+    }
+
+    if (!Number.isFinite(delay) || delay < 0) {
+      setComposeError('Delay must be a non-negative number.');
       return;
     }
 
     setBusy(true);
 
     try {
+      console.log('Sending scheduling request:', {
+        recipients,
+        subject,
+        senderId,
+        startAt,
+        delay
+      });
+
       const response = await fetch(`${API}/emails/schedule`, {
         method: 'POST',
         headers: {
@@ -135,9 +232,9 @@ export default function App() {
         },
         body: JSON.stringify({
           recipients,
-          subject,
-          body,
-          startAt: new Date(startAt).toISOString(),
+          subject: subject.trim(),
+          body: body.trim(),
+          startAt: selectedDate.toISOString(),
           delaySeconds: Number(delay),
           senderId
         })
@@ -145,16 +242,25 @@ export default function App() {
 
       const data = await response.json();
 
+      console.log('Scheduling API response:', response.status, data);
+
       if (!response.ok) {
-        throw new Error(data.error || 'Scheduling failed');
+        const invalidMessage = Array.isArray(data.invalidRecipients)
+          ? ` Invalid addresses: ${data.invalidRecipients.join(', ')}`
+          : '';
+
+        throw new Error(
+          (data.error || 'Scheduling failed') + invalidMessage
+        );
       }
 
       showNotice(
-        `Successfully scheduled ${data.count} emails.`,
+        `Successfully scheduled ${data.count} email(s).`,
         'success'
       );
 
       setCompose(false);
+      setComposeError('');
       setRecipients([]);
       setSubject('');
       setBody('');
@@ -167,9 +273,10 @@ export default function App() {
     } catch (error) {
       console.error('Scheduling error:', error);
 
-      showNotice(
-        error instanceof Error ? error.message : 'Scheduling failed.',
-        'error'
+      setComposeError(
+        error instanceof Error
+          ? error.message
+          : 'Scheduling failed. Please try again.'
       );
 
     } finally {
@@ -197,16 +304,33 @@ export default function App() {
       }
 
       showNotice('Email cancelled successfully!', 'success');
+
       await load();
 
     } catch (error) {
       console.error('Cancellation error:', error);
 
       showNotice(
-        error instanceof Error ? error.message : 'Unable to cancel email.',
+        error instanceof Error
+          ? error.message
+          : 'Unable to cancel email.',
         'error'
       );
     }
+  }
+
+  // Close compose modal
+  function closeCompose() {
+    if (busy) return;
+
+    setCompose(false);
+    setComposeError('');
+    setRecipients([]);
+    setSubject('');
+    setBody('');
+    setStartAt('');
+    setDelay(0);
+    setSenderId('sender-1');
   }
 
   const heading =
@@ -214,7 +338,9 @@ export default function App() {
       ? 'Scheduled Emails'
       : tab === 'sent'
         ? 'Sent Emails'
-        : 'Cancelled Emails';
+        : tab === 'failed'
+          ? 'Failed Emails'
+          : 'Cancelled Emails';
 
   const timeHeading =
     tab === 'sent' ? 'Sent time' : 'Scheduled time';
@@ -224,7 +350,18 @@ export default function App() {
       ? 'No scheduled emails yet.'
       : tab === 'sent'
         ? 'No sent emails yet.'
-        : 'No cancelled emails yet.';
+        : tab === 'failed'
+          ? 'No failed emails yet.'
+          : 'No cancelled emails yet.';
+
+  const emptyDescription =
+    tab === 'scheduled'
+      ? 'Compose a new email campaign to get started.'
+      : tab === 'sent'
+        ? 'Your successfully sent emails will appear here.'
+        : tab === 'failed'
+          ? 'Emails that failed after all retry attempts will appear here.'
+          : 'Emails you cancel will appear here.';
 
   return (
     <div className="app">
@@ -259,9 +396,13 @@ export default function App() {
 
           <button
             className="primary"
-            onClick={() => setCompose(true)}
+            onClick={() => {
+              setNotice('');
+              setComposeError('');
+              setCompose(true);
+            }}
           >
-            ＋ Compose New Email
+            + Compose New Email
           </button>
         </div>
 
@@ -270,11 +411,12 @@ export default function App() {
           <div
             className="notice"
             style={{
-              borderLeft: `4px solid ${noticeType === 'success' ? '#16a34a' : '#dc2626'}`
+              borderLeft: `4px solid ${
+                noticeType === 'success' ? '#16a34a' : '#dc2626'
+              }`
             }}
           >
             {notice}
-
             <button onClick={() => setNotice('')}>×</button>
           </div>
         )}
@@ -296,6 +438,13 @@ export default function App() {
           </button>
 
           <button
+            className={tab === 'failed' ? 'active' : ''}
+            onClick={() => setTab('failed')}
+          >
+            Failed
+          </button>
+
+          <button
             className={tab === 'cancelled' ? 'active' : ''}
             onClick={() => setTab('cancelled')}
           >
@@ -309,6 +458,7 @@ export default function App() {
           <div className="panel-head">
             <div>
               <h2>{heading}</h2>
+
               <p className="muted">
                 {initialLoading
                   ? 'Loading emails...'
@@ -340,7 +490,6 @@ export default function App() {
 
               <tbody>
 
-                {/* Loading State */}
                 {initialLoading && (
                   <tr>
                     <td
@@ -355,7 +504,6 @@ export default function App() {
                   </tr>
                 )}
 
-                {/* Email Rows */}
                 {!initialLoading && rows.map(email => (
                   <tr key={email.id}>
                     <td>{email.recipient}</td>
@@ -381,7 +529,15 @@ export default function App() {
                       </span>
 
                       {email.error && (
-                        <small title={email.error}> ⚠</small>
+                        <small
+                          title={email.error}
+                          style={{
+                            marginLeft: '6px',
+                            cursor: 'help'
+                          }}
+                        >
+                          ⚠
+                        </small>
                       )}
                     </td>
 
@@ -398,7 +554,6 @@ export default function App() {
                   </tr>
                 ))}
 
-                {/* Empty State */}
                 {!initialLoading && rows.length === 0 && (
                   <tr>
                     <td
@@ -407,18 +562,19 @@ export default function App() {
                     >
                       <div style={{ padding: '35px' }}>
                         <div style={{ fontSize: '35px' }}>
-                          {tab === 'scheduled' ? '📅' :
-                            tab === 'sent' ? '✉️' : '📭'}
+                          {tab === 'scheduled'
+                            ? '📅'
+                            : tab === 'sent'
+                              ? '✉️'
+                              : tab === 'failed'
+                                ? '⚠️'
+                                : '📭'}
                         </div>
 
                         <h3>{emptyMessage}</h3>
 
                         <p className="muted">
-                          {tab === 'scheduled'
-                            ? 'Compose a new email campaign to get started.'
-                            : tab === 'sent'
-                              ? 'Your successfully sent emails will appear here.'
-                              : 'Emails you cancel will appear here.'}
+                          {emptyDescription}
                         </p>
                       </div>
                     </td>
@@ -440,6 +596,7 @@ export default function App() {
             <div className="modal-head">
               <div>
                 <h2>Compose email campaign</h2>
+
                 <p className="muted">
                   Upload recipients and choose your schedule.
                 </p>
@@ -447,7 +604,8 @@ export default function App() {
 
               <button
                 className="close"
-                onClick={() => setCompose(false)}
+                onClick={closeCompose}
+                disabled={busy}
               >
                 ×
               </button>
@@ -474,13 +632,35 @@ export default function App() {
               accept=".csv,text/csv"
               onChange={event => {
                 const file = event.target.files?.[0];
-                if (file) parseCsv(file);
+
+                if (file) {
+                  setNotice('');
+                  parseCsv(file);
+                }
               }}
             />
 
             <div className="csv-count">
-              {recipients.length} recipients loaded
+              {recipients.length} recipient
+              {recipients.length === 1 ? '' : 's'} loaded
             </div>
+
+            {/* Visible validation errors */}
+            {composeError && (
+              <div
+                className="notice"
+                role="alert"
+                style={{
+                  borderLeft: '4px solid #dc2626',
+                  color: '#991b1b',
+                  background: '#fef2f2',
+                  padding: '12px',
+                  margin: '10px 0'
+                }}
+              >
+                {composeError}
+              </div>
+            )}
 
             <label>Subject</label>
 
@@ -527,14 +707,16 @@ export default function App() {
             <div className="modal-actions">
               <button
                 className="secondary"
-                onClick={() => setCompose(false)}
+                onClick={closeCompose}
+                disabled={busy}
               >
                 Cancel
               </button>
 
               <button
+                type="button"
                 className="primary"
-                disabled={busy}
+                disabled={busy || recipients.length === 0}
                 onClick={schedule}
               >
                 {busy ? 'Scheduling...' : 'Schedule emails'}

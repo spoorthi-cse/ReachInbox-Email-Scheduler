@@ -2,6 +2,7 @@
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
+import validator from 'validator';
 import { emailQueue } from './queue';
 import { prisma } from './db';
 import { createBullBoard } from '@bull-board/api';
@@ -10,10 +11,28 @@ import { ExpressAdapter } from '@bull-board/express';
 
 const app = express();
 
-app.use(cors({ origin: 'http://localhost:5173' }));
+// CORS configuration for local development and production
+const allowedOrigins = (
+  process.env.CORS_ORIGIN || 'http://localhost:5173'
+)
+  .split(',')
+  .map(origin => origin.trim());
+
+app.use(
+  cors({
+    origin: (origin, callback) => {
+      if (!origin || allowedOrigins.includes(origin)) {
+        return callback(null, true);
+      }
+
+      return callback(new Error('Not allowed by CORS'));
+    }
+  })
+);
+
 app.use(express.json({ limit: '5mb' }));
 
-// Bull Board
+// Bull Board dashboard
 const board = new ExpressAdapter();
 board.setBasePath('/admin/queues');
 
@@ -26,7 +45,10 @@ app.use('/admin/queues', board.getRouter());
 
 // Health check
 app.get('/api/health', (_req, res) => {
-  res.json({ ok: true });
+  res.json({
+    ok: true,
+    message: 'ReachInbox API is running'
+  });
 });
 
 // Get emails by status
@@ -48,14 +70,17 @@ app.get('/api/emails', async (req, res) => {
       orderBy: { scheduledAt: 'asc' }
     });
 
-    res.json(emails);
+    return res.json(emails);
   } catch (err) {
     console.error('Fetch emails error:', err);
-    res.status(500).json({ error: 'Failed to fetch emails' });
+
+    return res.status(500).json({
+      error: 'Failed to fetch emails'
+    });
   }
 });
 
-// Schedule emails with sender selection
+// Schedule emails
 app.post('/api/emails/schedule', async (req, res) => {
   try {
     const {
@@ -74,11 +99,12 @@ app.post('/api/emails/schedule', async (req, res) => {
       senderId?: string;
     };
 
+    // Validate required fields
     if (
       !Array.isArray(recipients) ||
       recipients.length === 0 ||
-      !subject ||
-      !body ||
+      !subject?.trim() ||
+      !body?.trim() ||
       !startAt
     ) {
       return res.status(400).json({
@@ -110,6 +136,7 @@ app.post('/api/emails/schedule', async (req, res) => {
       });
     }
 
+    // Validate scheduled date
     const start = new Date(startAt);
 
     if (Number.isNaN(start.getTime())) {
@@ -118,6 +145,7 @@ app.post('/api/emails/schedule', async (req, res) => {
       });
     }
 
+    // Validate delay
     const delay = Number(delaySeconds);
 
     if (!Number.isFinite(delay) || delay < 0) {
@@ -126,34 +154,66 @@ app.post('/api/emails/schedule', async (req, res) => {
       });
     }
 
+    // Normalize recipients
+    const normalizedRecipients = recipients.map(recipient =>
+      typeof recipient === 'string' ? recipient.trim() : ''
+    );
+
+    // Validate all recipients before saving
+    const invalidRecipients = normalizedRecipients.filter(
+      recipient =>
+        !recipient ||
+        recipient.length > 254 ||
+        !validator.isEmail(recipient, {
+          allow_display_name: false,
+          require_tld: true,
+          allow_utf8_local_part: false
+        })
+    );
+
+    if (invalidRecipients.length > 0) {
+      return res.status(400).json({
+        error:
+          'Some recipient email addresses are invalid. Please correct them before scheduling.',
+        invalidRecipients
+      });
+    }
+
+    // Remove duplicate email addresses
+    const uniqueRecipients = [
+      ...new Map(
+        normalizedRecipients.map(recipient => [
+          recipient.toLowerCase(),
+          recipient
+        ])
+      ).values()
+    ];
+
+    const duplicateCount =
+      normalizedRecipients.length - uniqueRecipients.length;
+
     const delayMs = delay * 1000;
     const results = [];
 
-    for (let i = 0; i < recipients.length; i++) {
-      const recipient = String(recipients[i]).trim();
-
-      // Validate email address
-      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(recipient)) {
-        continue;
-      }
+    // Save emails and add jobs to BullMQ
+    for (let i = 0; i < uniqueRecipients.length; i++) {
+      const recipient = uniqueRecipients[i];
 
       const scheduledAt = new Date(
         start.getTime() + i * delayMs
       );
 
-      // Save email and sender in PostgreSQL
       const record = await prisma.email.create({
         data: {
           recipient,
-          subject,
-          body,
+          subject: subject.trim(),
+          body: body.trim(),
           senderId,
           scheduledAt,
           status: 'scheduled'
         }
       });
 
-      // Add email to BullMQ
       await emailQueue.add(
         'send-email',
         { emailId: record.id },
@@ -176,22 +236,16 @@ app.post('/api/emails/schedule', async (req, res) => {
       results.push(record);
     }
 
-    if (results.length === 0) {
-      return res.status(400).json({
-        error: 'No valid recipient email addresses found'
-      });
-    }
-
-    res.status(201).json({
+    return res.status(201).json({
       count: results.length,
       senderId,
+      duplicateCount,
       emails: results
     });
-
   } catch (err) {
     console.error('Schedule error:', err);
 
-    res.status(500).json({
+    return res.status(500).json({
       error: 'Failed to schedule emails'
     });
   }
@@ -254,25 +308,44 @@ app.delete('/api/emails/:id', async (req, res) => {
       });
     }
 
-    res.json({
+    return res.json({
       message: 'Email cancelled successfully',
       id
     });
-
   } catch (err) {
     console.error('Cancel email error:', err);
 
-    res.status(500).json({
+    return res.status(500).json({
       error: 'Failed to cancel email'
     });
   }
 });
 
-// Start server
+// Start API server
 const port = Number(process.env.PORT || 4000);
 
-app.listen(port, () => {
-  console.log(
-    `API running at http://localhost:${port}; Bull Board: /admin/queues`
-  );
+const server = app.listen(port, '0.0.0.0', () => {
+  console.log(`ReachInbox API running on port ${port}`);
+  console.log('Bull Board: /admin/queues');
 });
+
+// Graceful shutdown
+async function shutdown(signal: string) {
+  console.log(`${signal} received. Shutting down API...`);
+
+  server.close(async () => {
+    try {
+      await emailQueue.close();
+      await prisma.$disconnect();
+
+      console.log('API shutdown complete');
+      process.exit(0);
+    } catch (error) {
+      console.error('API shutdown error:', error);
+      process.exit(1);
+    }
+  });
+}
+
+process.on('SIGTERM', () => void shutdown('SIGTERM'));
+process.on('SIGINT', () => void shutdown('SIGINT'));

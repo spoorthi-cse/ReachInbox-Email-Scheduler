@@ -6,10 +6,21 @@ import { prisma } from './db';
 import { getTransporter, getSenderAddress } from './mailer';
 import nodemailer from 'nodemailer';
 
-const MAX_EMAILS_PER_HOUR = Number(process.env.MAX_EMAILS_PER_HOUR || 100);
-const RATE_LIMIT_DURATION_MS = Number(process.env.RATE_LIMIT_DURATION_MS || 3600000);
-const MIN_SEND_INTERVAL_MS = Number(process.env.MIN_SEND_INTERVAL_MS || 10000);
-const WORKER_CONCURRENCY = Number(process.env.WORKER_CONCURRENCY || 5);
+const MAX_EMAILS_PER_HOUR = Number(
+  process.env.MAX_EMAILS_PER_HOUR || 100
+);
+
+const RATE_LIMIT_DURATION_MS = Number(
+  process.env.RATE_LIMIT_DURATION_MS || 3600000
+);
+
+const MIN_SEND_INTERVAL_MS = Number(
+  process.env.MIN_SEND_INTERVAL_MS || 10000
+);
+
+const WORKER_CONCURRENCY = Number(
+  process.env.WORKER_CONCURRENCY || 5
+);
 
 const spacingScript = `
 local time = redis.call('TIME')
@@ -27,7 +38,9 @@ return nextAllowed - now
 `;
 
 async function reserveSendingSlot(): Promise<number> {
-  if (MIN_SEND_INTERVAL_MS === 0) return 0;
+  if (MIN_SEND_INTERVAL_MS === 0) {
+    return 0;
+  }
 
   const waitTime = await connection.eval(
     spacingScript,
@@ -46,7 +59,12 @@ const worker = new Worker(
       where: { id: job.data.emailId }
     });
 
-    if (!email || email.status === 'sent' || email.status === 'cancelled') {
+    if (
+      !email ||
+      email.status === 'sent' ||
+      email.status === 'cancelled' ||
+      email.status === 'failed'
+    ) {
       console.log(`Skipping email ${job.data.emailId}`);
       return;
     }
@@ -84,18 +102,35 @@ const worker = new Worker(
 
       console.log(`Email sent to ${email.recipient} using ${senderId}`);
       console.log(`Ethereal preview: ${preview || 'Unavailable'}`);
+
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
+      const message =
+        error instanceof Error ? error.message : String(error);
 
-      await prisma.email.update({
-        where: { id: email.id },
-        data: {
-          status: 'failed',
-          error: message
-        }
-      });
+      const maxAttempts = job.opts.attempts ?? 1;
+      const isFinalAttempt =
+        job.attemptsMade + 1 >= maxAttempts;
 
-      console.error(`Email failed: ${email.recipient}`, message);
+      if (isFinalAttempt) {
+        await prisma.email.update({
+          where: { id: email.id },
+          data: {
+            status: 'failed',
+            error: message
+          }
+        });
+
+        console.error(
+          `Email permanently failed after ${maxAttempts} attempts: ${email.recipient}`,
+          message
+        );
+      } else {
+        console.error(
+          `Email attempt ${job.attemptsMade + 1}/${maxAttempts} failed. BullMQ will retry: ${email.recipient}`,
+          message
+        );
+      }
+
       throw error;
     }
   },
@@ -125,3 +160,31 @@ console.log('Email worker started');
 console.log(`Hourly limit: ${MAX_EMAILS_PER_HOUR}`);
 console.log(`Minimum interval: ${MIN_SEND_INTERVAL_MS} ms`);
 console.log(`Worker concurrency: ${WORKER_CONCURRENCY}`);
+
+// Graceful shutdown for Railway deployments
+let isShuttingDown = false;
+
+async function shutdown(signal: string) {
+  if (isShuttingDown) return;
+
+  isShuttingDown = true;
+  console.log(`${signal} received. Shutting down email worker...`);
+
+  try {
+    // Stop accepting new jobs and wait for active jobs to finish.
+    await worker.close();
+
+    // Close Redis and database connections.
+    await connection.quit();
+    await prisma.$disconnect();
+
+    console.log('Email worker shutdown complete');
+    process.exit(0);
+  } catch (error) {
+    console.error('Worker shutdown error:', error);
+    process.exit(1);
+  }
+}
+
+process.on('SIGTERM', () => void shutdown('SIGTERM'));
+process.on('SIGINT', () => void shutdown('SIGINT'));
